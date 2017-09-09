@@ -1,0 +1,212 @@
+---
+- name: Set initial facts
+  set_fact: 
+    sql_tmp_dir: "ansible_sql_{{ ansible_date_time.epoch }}"
+    hosts: |
+      {% set comma = joiner(",") %}
+      {% for item in groups['vertica'] -%}
+          {{ comma() }}{{ item }}
+      {%- endfor %}
+    vertica_package_name: vertica.x86_64
+    admintools_conf_file: /opt/vertica/config/admintools.conf
+
+- name: Define install hosts 
+  set_fact:
+    install_hosts: "{{ hosts| replace('\n', '') }}"
+
+- name: yum install packages
+  yum: name="{{ item }}" state=present
+  with_items:
+    - libselinux-python
+    - ntp
+    - mcelog
+    - sysstat
+    - gdb
+    - dialog
+    - tzdata
+    - openssl
+    - openssl-devel
+
+- name: Create {{ vertica_dba_group }} group. 
+  group: name="{{ vertica_dba_group }}" state=present
+
+- name: Create {{ vertica_dba_user }} user
+  user:
+    name: "{{ vertica_dba_user }}"
+    group: "{{ vertica_dba_group }}"
+    shell: /bin/bash
+    home: /home/dbadmin
+    generate_ssh_key: yes
+
+# Copy first node root user keys keys to remaining nodes
+- name: Ensure root user public keys exist
+  user:
+    name: root 
+    generate_ssh_key: yes
+  when: skip_keys|bool == false
+
+- name: retrieve roots public key
+  shell: cat /root/.ssh/id_rsa.pub
+  register: node1_root_public_key
+  changed_when: false
+  delegate_to: "{{ groups['vertica']|first }}"
+  run_once: yes
+  when: skip_keys|bool == false
+
+- name: Add first node root public key to remaining nodes for root and ansible_user
+  authorized_key:
+    user: "{{ item }}"
+    key: "{{ node1_root_public_key.stdout }}"
+  with_items:
+    - root
+    - "{{ ansible_user }}"
+  when: ( inventory_hostname not in groups['vertica']|first and skip_keys|bool == false)
+
+#- meta: end_play
+
+# Disable SELinux
+- name: Disable SELINUX
+  selinux: state=disabled
+
+- name: Create data and catalog directories 
+  file: path="{{ item }}" state=directory owner="{{ vertica_dba_user }}" group="{{ vertica_dba_group }}" mode=0755
+  with_items: 
+    - "{{ vertica_catalog_path }}"
+    - "{{ vertica_data_path }}"
+
+- name: Get mount point info for catalog and data directories
+  shell: df -P {{ item }} | grep -v '^Filesystem' | cut -d' ' -f 1
+  register: vertica_mounts
+  with_items:
+    - "{{ vertica_catalog_path }}"
+    - "{{ vertica_data_path }}"
+
+#- debug: msg="mount is {{ item }}"
+#  with_items: 
+#    - "{{ vertica_mounts.results|map(attribute='stdout')|list|unique }}"
+
+- name: Set readahead values for your install path
+  command: "/sbin/blockdev --setra 2048 {{ item }}"
+  with_items: 
+    - "{{ vertica_mounts.results|map(attribute='stdout')|list|unique }}"
+
+- name: Add readahead values for your install path in rc.local
+  lineinfile: 
+    dest: /etc/rc.local
+    state: present
+    line: "/sbin/blockdev --setra 2048 {{ item }}"
+  with_items: 
+    - "{{ vertica_mounts.results|map(attribute='stdout')|list|unique }}"
+
+- name: Disable huepages 
+  command: " echo never > /sys/kernel/mm/redhat_transparent_hugepage/enabled"
+
+- name: Insert huepages check if it doesnt exist
+  blockinfile:
+    dest: /etc/rc.local
+    block: | 
+      if test -f /sys/kernel/mm/redhat_transparent_hugepage/enabled; then
+       echo never > /sys/kernel/mm/redhat_transparent_hugepage/enabled
+      fi
+
+- name: start services
+  service: state=started name="{{ item }}"
+  with_items:
+    - ntpd
+
+- name: Copy TZ file
+  copy: src=export_tz.sh dest=/etc/profile.d/export_tz.sh
+
+- name: set timezone to UTC
+  timezone: name=UTC
+
+- name: check if "{{ vertica_package_name }}" is installed
+  yum: list="{{ vertica_package_name }}"
+  register: is_installed
+
+- debug: var=vertica_rpm
+
+- name: "Copying {{ vertica_package_name }} RPM"
+  copy: src="{{ vertica_rpm }}" dest=/tmp force=no
+  when: "(is_installed|default('not installed') != 'not installed')"
+
+- name: Install Vertica RPM file
+  yum: name="/tmp/{{ vertica_rpm }}" state=present
+  when: "(is_installed|default('not installed') != 'not installed')"
+
+- name: Change ownership of vertica install directory 
+  file:
+    path: /opt/vertica
+    owner: dbadmin
+    group: verticadba
+    mode: 0755
+    recurse: yes
+    state: directory
+    follow: yes
+
+- set_fact: install_file="{{ properties_file | default('install.properties') }}"
+
+- set_fact: db_exists_check="[Database:{{ db_name }}]"
+
+- name: Copying Properties file 
+  template: src="{{ properties_file | default('install.properties.j2') }}" dest=/tmp/install.properties
+
+# Check if admintools.conf exists. 
+- stat: path=/opt/vertica/config/admintools.conf
+  register: admintools_conf
+
+- debug: var=admintools_conf
+#- meta: end_play
+
+# Command to install with properties file
+- name: Run install_vertica command
+  command: /opt/vertica/sbin/install_vertica --config-file /tmp/{{ install_file }} -r /tmp/{{ vertica_rpm }} -T
+  become: yes
+  become_user: root
+  when: (admintools_conf.stat.exists == false)  and ( inventory_hostname in groups['vertica']|first ) 
+  register: vertica_installed
+
+- stat: path=/opt/vertica/config/admintools.conf
+  register: admintools_conf_after_install
+
+- name: Check if we have this database already installed
+  command: "grep -F [Database:{{ db_name }}] {{ admintools_conf_file }}"
+  failed_when: dbExists.rc == 2
+  when: (admintools_conf_after_install.stat.exists == true)
+  register: dbExists
+
+- debug: var=dbExists|default('not defined')
+- debug: var=db_name
+- debug: var=vertica_catalog_path
+- debug: var=vertica_data_path
+
+- name:  Remove db directory if its present but not defined in vertica
+  file: path="{{ item }}/{{ db_name }}" state=absent
+  with_items: 
+   - "{{ vertica_catalog_path }}"
+   - "{{ vertica_data_path }}" 
+  when: ( dbExists is defined and db_exists_check not in dbExists.stdout )
+
+- name: "Create {{ db_name }} database if it doesnt exist"
+  become_method: sudo
+# become_method: su
+  become: yes
+# remote_user: dbadmin
+  shell: "su - dbadmin -c '/opt/vertica/bin/admintools --tool create_db  -s {{ install_hosts }} -d {{ db_name }} -c {{ vertica_catalog_path }} -D {{ vertica_data_path }} -p  {{ db_password }} --skip-fs-checks'"
+  when: "(( inventory_hostname in groups['vertica']|first ) and ( dbExists is defined and \"[Database:{{ db_name }}]\" not in dbExists.stdout ))"
+
+- name: Create tmp dir
+  file: path="/tmp/{{ sql_tmp_dir }}" state=directory
+
+- name: Copy each file over that matches the given pattern
+  copy:
+    src: "{{ item }}"
+    dest: "/tmp/{{ sql_tmp_dir }}"
+    owner: "root"
+    mode: 600
+  with_fileglob:
+    - "ddl/*.sql"
+
+# Add steps here to run the above sql files
+- name: cleanup tmp dir
+  file: path="/tmp/{{ sql_tmp_dir }}" state=absent

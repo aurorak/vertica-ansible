@@ -1,0 +1,7 @@
+- name: Apply the vertica role to the vertica nodes in the cluster
+  hosts: vertica
+  become: yes
+  roles:
+    - { role: vertica }
+  tags:
+    - deploy_vertica

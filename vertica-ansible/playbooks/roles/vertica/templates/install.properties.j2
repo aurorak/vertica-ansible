@@ -1,0 +1,7 @@
+accept_eula = True
+license_file = CE
+vertica_dba_group = verticadba
+vertica_dba_user = {{ dbadmin_user | default('dbadmin') }}
+vertica_dba_user_password = {{ dbadmin_password | default('dbadmin') }}
+hosts={{ install_hosts }}
+failure_threshold=FAIL
